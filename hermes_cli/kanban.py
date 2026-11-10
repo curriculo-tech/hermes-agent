@@ -880,8 +880,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = gate_err
                 return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
-            return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                    expected_run_id=_worker_run_id_for(tid))
+            try:
+                return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
+                                        expected_run_id=_worker_run_id_for(tid))
+            except kb.OpenChildrenError as open_err:
+                fail_msg[tid] = (
+                    f"cannot complete {tid}: {open_err}. Finish or archive the listed children "
+                    "first, or re-run with --metadata '{\"allow_open_children\": \"<reason>\"}' "
+                    "(or {\"superseded_by\": \"<card id>\"}) to close the parent deliberately."
+                )
+                return False
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 

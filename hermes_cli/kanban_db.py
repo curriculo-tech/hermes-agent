@@ -2529,8 +2529,95 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class OpenChildrenError(ValueError):
+    """``complete_task`` refused: this parent/tracking card still has open
+    (not done/archived) children with no evidence, so closing it now would be
+    a no-op completion while the real work sits unstarted. A ``ValueError``
+    so tool error handlers treat it as recoverable; the caller can override
+    deliberately via ``metadata['allow_open_children']`` or
+    ``metadata['superseded_by']``."""
+
+    def __init__(self, task_id: str, blockers: list[tuple[str, str]]):
+        self.task_id = task_id
+        self.blockers = list(blockers)
+        super().__init__(
+            f"completion blocked: {task_id} has open children without evidence: "
+            + ", ".join(f"{cid} ({status})" for cid, status in blockers)
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
+
+
+def _has_completion_override(metadata: Any, key: str) -> bool:
+    """True iff ``metadata`` is a dict carrying ``key`` as a non-empty string
+    (after strip) or a truthy non-string value."""
+    if not isinstance(metadata, dict) or key not in metadata:
+        return False
+    value = metadata[key]
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
+
+
+def open_children_without_evidence(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
+    """Read-only: ``(id, status)`` for open children of ``task_id`` with no
+    evidence. Children = ``task_links.child_id`` where ``parent_id=task_id``
+    and their status is not ``done``/``archived``; evidence for a child is a
+    stripped non-empty ``tasks.result`` OR the stripped non-empty ``summary``
+    of its latest ``task_runs`` row. Ordered by child id."""
+    blockers: list[tuple[str, str]] = []
+    rows = conn.execute(
+        """
+        SELECT c.id      AS id,
+               c.status  AS status,
+               c.result  AS result,
+               (SELECT r.summary FROM task_runs r
+                 WHERE r.task_id = c.id ORDER BY r.id DESC LIMIT 1) AS run_summary
+          FROM task_links l
+          JOIN tasks c ON c.id = l.child_id
+         WHERE l.parent_id = ?
+           AND c.status NOT IN ('done', 'archived')
+         ORDER BY c.id
+        """,
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        has_result = isinstance(row["result"], str) and bool(row["result"].strip())
+        has_summary = isinstance(row["run_summary"], str) and bool(row["run_summary"].strip())
+        if not (has_result or has_summary):
+            blockers.append((row["id"], row["status"]))
+    return blockers
+
+
+def _gate_open_children(conn: sqlite3.Connection, task_id: str, metadata: Optional[dict]) -> None:
+    """Refuse a no-op completion while open children have no evidence
+    (:class:`OpenChildrenError`, after an auditable event) unless the caller
+    overrode deliberately: ``superseded_by`` passes silently (carve-out),
+    ``allow_open_children`` passes with a ``completion_allowed_open_children``
+    event recording the reason."""
+    if _task_status(conn, task_id) not in ("running", "ready", "blocked", "review"):
+        return  # already terminal; complete_task is a no-op, not a gate case
+    blockers = open_children_without_evidence(conn, task_id)
+    if not blockers:
+        return
+    children_payload = [{"id": cid, "status": status} for cid, status in blockers]
+    if _has_completion_override(metadata, "superseded_by"):
+        return  # Deliberate supersede-close; no event.
+    if _has_completion_override(metadata, "allow_open_children"):
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_allowed_open_children",
+                {"children": children_payload,
+                 "reason": str(metadata["allow_open_children"]).strip()[:400]},
+            )
+        return
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "completion_blocked_open_children", {"children": children_payload},
+        )
+    raise OpenChildrenError(task_id, blockers)
 
 
 def complete_task(
@@ -2548,11 +2635,15 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+    A parent with open (not done/archived) children that carry no evidence is
+    refused with :class:`OpenChildrenError` unless the caller overrides via
+    ``metadata['allow_open_children']`` or ``metadata['superseded_by']``.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    _gate_open_children(conn, task_id, metadata)
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     metadata = _merge_completion_prose_artifacts(
