@@ -2529,6 +2529,26 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class OpenChildrenError(ValueError):
+    """``complete_task`` refused: the task completes with no result/summary
+    while direct children are still open (non-terminal) and equally
+    evidence-empty (no ``tasks.result``, no closing ``task_runs.summary``) —
+    the noop-loop shape. ``.open_children`` carries ``(child_id, status)``
+    pairs. A ``ValueError`` so tool error handlers treat it as recoverable."""
+
+    def __init__(self, open_children: list[tuple[str, str]], completing_task_id: str):
+        self.open_children = list(open_children)
+        self.completing_task_id = completing_task_id
+        listing = ", ".join(f"{cid} ({status})" for cid, status in self.open_children)
+        super().__init__(
+            f"completion blocked: task {completing_task_id} would finish with no "
+            f"result/summary while open children have produced no evidence: {listing}. "
+            f"Finish the children first, or set metadata['allow_open_children'] to a "
+            f"non-empty reason to defer them, or metadata['superseded_by'] to the "
+            f"replacing task id."
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -2548,7 +2568,15 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+    An EMPTY-evidence completion (no ``result`` and no ``summary``) of a task
+    with un-started children raises :class:`OpenChildrenError` after an
+    auditable event; ``metadata['allow_open_children']`` (reasoned deferral)
+    and ``metadata['superseded_by']`` (replacement task) are the escapes.
     """
+    # Empty-evidence parent completion above un-started children is the
+    # noop-loop shape; gate FIRST, before any other check or write (mirrors
+    # _gate_created_cards: auditable event, recoverable raise).
+    _gate_open_empty_children(conn, task_id, result=result, summary=summary, metadata=metadata)
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2567,6 +2595,13 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        # Race guard: a child linked between the pre-gate and this txn must
+        # not slip through. No second event — the pre-gate already audited.
+        open_empty = _open_empty_child_blockers(
+            conn, task_id, result=result, summary=summary, metadata=metadata,
+        )
+        if open_empty:
+            raise OpenChildrenError(open_empty, task_id)
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         prior_status = _task_status(conn, task_id)
@@ -2647,6 +2682,89 @@ def _gate_created_cards(
             )
         raise HallucinatedCardsError(phantom_cards, task_id)
     return verified_cards
+
+
+def _open_empty_children(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
+    """Direct children of ``task_id`` that are non-terminal AND evidence-empty
+    — neither a ``tasks.result`` nor a closing ``task_runs.summary`` (latest
+    run wins) — as ``(child_id, status)`` pairs ordered by id. These look
+    un-started: completing the parent above them with no handoff evidence is
+    the noop-loop shape the gate rejects."""
+    rows = conn.execute(
+        """
+        SELECT t.id AS id, t.status AS status
+          FROM task_links l
+          JOIN tasks t ON t.id = l.child_id
+         WHERE l.parent_id = ?
+           AND t.status NOT IN ('done', 'archived')
+           AND COALESCE(TRIM(t.result), '') = ''
+           AND COALESCE((
+                SELECT TRIM(r.summary) FROM task_runs r
+                 WHERE r.task_id = t.id
+                 ORDER BY r.id DESC LIMIT 1
+           ), '') = ''
+         ORDER BY t.id
+        """,
+        (task_id,),
+    ).fetchall()
+    return [(row["id"], row["status"]) for row in rows]
+
+
+def _open_children_override(metadata: Any) -> bool:
+    """Explicit carve-outs: ``metadata['superseded_by']`` (a replacement task
+    exists) or ``metadata['allow_open_children']`` (a reasoned deferral, i.e.
+    a non-empty string) both authorise an evidence-empty completion."""
+    if not isinstance(metadata, dict):
+        return False
+    superseded_by = metadata.get("superseded_by")
+    if isinstance(superseded_by, str):
+        superseded_by = superseded_by.strip()
+    if superseded_by:
+        return True
+    allow = metadata.get("allow_open_children")
+    return isinstance(allow, str) and bool(allow.strip())
+
+
+def _open_empty_child_blockers(
+    conn: sqlite3.Connection, task_id: str, *, result: Optional[str],
+    summary: Optional[str], metadata: Optional[dict],
+) -> list[tuple[str, str]]:
+    """Children that block this completion, or ``[]``. A completion that
+    supplies real evidence (non-empty ``result``/``summary``) is NEVER
+    rejected; carve-outs (:func:`_open_children_override`) pass as well."""
+    if (summary or "").strip() or (result or "").strip():
+        return []
+    if _open_children_override(metadata):
+        return []
+    return _open_empty_children(conn, task_id)
+
+
+def _gate_open_empty_children(
+    conn: sqlite3.Connection, task_id: str, *, result: Optional[str],
+    summary: Optional[str], metadata: Optional[dict],
+) -> None:
+    """Reject an EMPTY-EVIDENCE completion while un-started (non-terminal,
+    evidence-empty) children exist. Mirrors :func:`_gate_created_cards`: runs
+    BEFORE the main write txn, records ``completion_blocked_open_children`` in
+    its own tiny txn (auditable), then raises :class:`OpenChildrenError`
+    without touching task state."""
+    open_empty = _open_empty_child_blockers(
+        conn, task_id, result=result, summary=summary, metadata=metadata,
+    )
+    if not open_empty:
+        return
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "completion_blocked_open_children",
+            {
+                "open_children": [
+                    {"id": cid, "status": status} for cid, status in open_empty
+                ],
+                "result_len": 0,
+                "summary": None,
+            },
+        )
+    raise OpenChildrenError(open_empty, task_id)
 
 
 def _stage_completion_artifacts(
