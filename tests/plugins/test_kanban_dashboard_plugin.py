@@ -290,7 +290,7 @@ def test_reopening_parent_demotes_ready_child(client):
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "done"},
+        json={"status": "done", "result": "Parent completed for reopen check"},
     )
     assert r.status_code == 200
 
@@ -309,6 +309,31 @@ def test_reopening_parent_demotes_ready_child(client):
         f"/api/plugins/kanban/tasks/{child['id']}"
     ).json()["task"]
     assert child_after_reopen["status"] == "todo"
+
+
+def test_dashboard_done_with_open_empty_child_returns_400(client):
+    """Empty-evidence parent `done` over an open evidence-empty child is refused
+    with the kernel's actionable message, not a 500, and mutates nothing."""
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "c", "parents": [parent["id"]]},
+    ).json()["task"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}",
+        json={"status": "done"},
+    )
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert child["id"] in detail
+    assert "allow_open_children" in detail
+    assert "superseded_by" in detail
+
+    parent_after = client.get(
+        f"/api/plugins/kanban/tasks/{parent['id']}"
+    ).json()["task"]
+    assert parent_after["status"] != "done"
 
 
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
@@ -419,7 +444,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{parent_id}",
-        json={"status": "done"},
+        json={"status": "done", "result": "Parent re-completed after retraction check"},
     )
     assert response.status_code == 200, response.text
     with kbc.connect() as conn:
