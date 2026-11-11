@@ -880,8 +880,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = gate_err
                 return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
-            return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                    expected_run_id=_worker_run_id_for(tid))
+            try:
+                return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
+                                        expected_run_id=_worker_run_id_for(tid))
+            except kb.OpenChildrenError as open_err:
+                # Gate runs before any write txn: the task was NOT mutated, so
+                # surface the offending child ids + statuses and stay non-zero.
+                fail_msg[tid] = str(open_err)
+                return False
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 
