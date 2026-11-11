@@ -608,6 +608,12 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"in-flight (no state change). Retry kanban_complete with the same "
                 f"summary/metadata and either drop these ids from created_cards, or pass "
                 f"created_cards=[] to skip the card-claim check entirely.")
+        except kb.OpenChildrenError as open_err:
+            # Same contract as the hallucinated-cards gate: refused before the
+            # write txn, so no state changed. str(open_err) names every child
+            # (id + status) and already carries the in-flight line plus both
+            # override hints (metadata.allow_open_children / metadata.superseded_by).
+            return tool_error(f"kanban_complete blocked: {open_err}")
         task = kb.get_task(conn, tid)
         _check(ok, (task.last_failure_error if task else None) or
                f"could not complete {tid} (unknown id, stale run, or already terminal)")

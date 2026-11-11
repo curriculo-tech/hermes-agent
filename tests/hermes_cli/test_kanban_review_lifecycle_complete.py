@@ -216,7 +216,8 @@ def test_review_changes_reapply_parent_gate(conn):
 
     # Move the task through review while its parent is temporarily terminal,
     # then make the parent non-terminal again before changes are requested.
-    assert kb.complete_task(conn, parent_id)
+    # Real evidence: the open-children gate does not apply to evidenced closes.
+    assert kb.complete_task(conn, parent_id, summary="upstream prerequisite landed")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
     assert kb.request_review(
@@ -264,7 +265,8 @@ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
     still_running = kb.get_task(conn, task_id)
     assert still_running is not None
     assert still_running.status == "running"
-    assert kb.complete_task(conn, parent_id)
+    # Real evidence: the open-children gate does not apply to evidenced closes.
+    assert kb.complete_task(conn, parent_id, summary="upstream prerequisite landed")
     assert kb.request_review(
         conn,
         task_id,
