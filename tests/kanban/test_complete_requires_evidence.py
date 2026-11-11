@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,19 @@ def _make_parent_with_done_children(conn, n: int = 2) -> tuple[str, list[str]]:
     for kid in kids:
         kb.link_tasks(conn, parent, kid)
     return parent, kids
+
+
+def _make_parent_with_running_child(conn) -> tuple[str, str]:
+    """Parent (ready) with one linked child running, no evidence yet.
+
+    Raw status flip mirrors test_kanban_core_functionality.py: the gate only
+    reads status/result/run-summary, so no claim machinery is needed.
+    """
+    parent = kb.create_task(conn, title="parent task")
+    child = kb.create_task(conn, title="child task", parents=[parent])
+    conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (child,))
+    conn.commit()
+    return parent, child
 
 
 # ---------------------------------------------------------------------------
@@ -218,3 +232,45 @@ def test_cli_complete_open_child_nonzero_then_override_zero(kanban_home):
         "--metadata", '{"allow_open_children":"reason"}',
     )
     assert overridden.returncode == 0, overridden.stderr
+
+
+# ---------------------------------------------------------------------------
+# G: non-terminal child WITH evidence -> never an offending child
+# ---------------------------------------------------------------------------
+
+
+def test_child_with_result_evidence_does_not_block_parent_completion(kanban_home):
+    """A still-running child whose ``tasks.result`` carries evidence is not
+    offending: the parent closes empty-handed with no override needed."""
+    with kbc.connect() as conn:
+        parent, child = _make_parent_with_running_child(conn)
+        conn.execute(
+            "UPDATE tasks SET result = ? WHERE id = ?",
+            ("child recorded evidence on its result", child),
+        )
+        conn.commit()
+        assert kb.complete_task(conn, parent)
+        assert kb.get_task(conn, parent).status == "done"
+        # Child stays in-flight: evidence on it gates nothing.
+        assert kb.get_task(conn, child).status == "running"
+
+
+def test_child_with_run_summary_evidence_does_not_block_parent_completion(kanban_home):
+    """Same, but the child's evidence is a non-empty summary on its latest
+    ``task_runs`` row (the worker handoff path) while ``tasks.result`` stays
+    empty. Insert mirrors the direct task_runs inserts used in tests/hermes_cli
+    and tests/plugins."""
+    with kbc.connect() as conn:
+        parent, child = _make_parent_with_running_child(conn)
+        started = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, summary, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?, ?)",
+            (child, "child handed off evidence via run summary",
+             started, started + 60),
+        )
+        conn.commit()
+        assert kb.complete_task(conn, parent)
+        assert kb.get_task(conn, parent).status == "done"
+        assert kb.get_task(conn, child).status == "running"
