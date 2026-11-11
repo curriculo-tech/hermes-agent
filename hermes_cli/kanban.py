@@ -884,7 +884,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid))
             except kb.OpenChildrenError as open_err:
-                # Gate runs before any write txn: the task was NOT mutated, so
+                # The pre-gate runs before any write txn and a second re-check
+                # runs under the write lock, so a rejection mutates nothing:
                 # surface the offending child ids + statuses and stay non-zero.
                 fail_msg[tid] = str(open_err)
                 return False

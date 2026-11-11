@@ -2595,9 +2595,13 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-# Statuses complete_task's CAS UPDATE accepts (keep in sync with the SQL
-# below). The open-children gate is scoped to these: completing an
-# already-terminal id (done/archived) is a plain noop (False), never a refusal.
+# Statuses complete_task's CAS UPDATE accepts. The open-children gate is
+# scoped to these: completing an already-terminal id (done/archived) is a
+# plain noop (False), never a refusal. MUST stay identical to the status
+# list in the CAS UPDATE below — "WHERE status IN ('running', 'ready',
+# 'blocked', 'review')" (~line 2681): drift either silently bypasses the
+# gate (a status the SQL accepts but this tuple omits) or turns a terminal
+# noop into a refusal (a status this tuple has but the SQL does not).
 _COMPLETABLE_STATUSES = ("running", "ready", "blocked", "review")
 
 
