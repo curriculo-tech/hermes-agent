@@ -184,3 +184,23 @@ def test_gate_uses_scratch_kanban_db_fixture(kanban_home, tmp_path):
         assert new_events == [(events_before[-1][0] + 1, parent, "completion_blocked_open_children")]
     finally:
         conn.close()
+
+
+def test_already_done_parent_with_open_child_is_noop_false(kanban_home):
+    """Bulk/scripted completes over non-actionable ids stay noops: a parent
+    already ``done`` (a status the CAS rejects) with an open evidence-empty
+    child returns ``False`` — no OpenChildrenError, no audit spam."""
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="parent slice", assignee="alice")
+        kb.claim_task(conn, parent)
+        assert kb.complete_task(conn, parent, result="shipped slice") is True
+        assert kb.get_task(conn, parent).status == "done"
+        child = kb.create_task(conn, title="child slice", assignee="bob", parents=[parent])
+        assert kb.get_task(conn, child).status not in ("done", "archived")
+
+        assert kb.complete_task(conn, parent) is False
+        assert kb.get_task(conn, parent).status == "done"
+        assert "completion_blocked_open_children" not in _event_kinds(conn, parent)
+    finally:
+        conn.close()

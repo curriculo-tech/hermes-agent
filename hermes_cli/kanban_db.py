@@ -2575,8 +2575,11 @@ def complete_task(
     """
     # Empty-evidence parent completion above un-started children is the
     # noop-loop shape; gate FIRST, before any other check or write (mirrors
-    # _gate_created_cards: auditable event, recoverable raise).
-    _gate_open_empty_children(conn, task_id, result=result, summary=summary, metadata=metadata)
+    # _gate_created_cards: auditable event, recoverable raise). Only for a
+    # current status the CAS below would accept — an already-done/archived
+    # (or triage/todo/unknown) id is a plain noop False, not a gate rejection.
+    if _task_status(conn, task_id) in ("running", "ready", "blocked", "review"):
+        _gate_open_empty_children(conn, task_id, result=result, summary=summary, metadata=metadata)
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2596,15 +2599,20 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         # Race guard: a child linked between the pre-gate and this txn must
-        # not slip through. No second event — the pre-gate already audited.
-        open_empty = _open_empty_child_blockers(
-            conn, task_id, result=result, summary=summary, metadata=metadata,
-        )
-        if open_empty:
-            raise OpenChildrenError(open_empty, task_id)
+        # not slip through. Scoped, like the pre-gate, to statuses the CAS
+        # below accepts — a task already done/archived (or otherwise
+        # non-actionable) falls through to the CAS's noop False. No second
+        # event — this window only opens when the pre-gate found nothing
+        # (and so audited nothing); the raise alone surfaces the miss.
+        prior_status = _task_status(conn, task_id)
+        if prior_status in ("running", "ready", "blocked", "review"):
+            open_empty = _open_empty_child_blockers(
+                conn, task_id, result=result, summary=summary, metadata=metadata,
+            )
+            if open_empty:
+                raise OpenChildrenError(open_empty, task_id)
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
-        prior_status = _task_status(conn, task_id)
         sql = """
                 UPDATE tasks
                    SET status       = 'done',
