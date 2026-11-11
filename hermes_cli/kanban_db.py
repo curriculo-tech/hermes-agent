@@ -2595,6 +2595,12 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+# Statuses complete_task's CAS UPDATE accepts (keep in sync with the SQL
+# below). The open-children gate is scoped to these: completing an
+# already-terminal id (done/archived) is a plain noop (False), never a refusal.
+_COMPLETABLE_STATUSES = ("running", "ready", "blocked", "review")
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2612,7 +2618,10 @@ def complete_task(
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     Completing with empty evidence while open children have none either
     raises :class:`OpenChildrenError` (``metadata.superseded_by`` /
-    ``metadata.allow_open_children`` override).
+    ``metadata.allow_open_children`` override). The gate only applies to the
+    statuses the CAS accepts — a terminal id noops with ``False`` — and is
+    re-checked inside the write txn so a child linked mid-call cannot slip
+    through.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2623,11 +2632,16 @@ def complete_task(
     # done/archived) is refused BEFORE any write txn — nothing is mutated.
     # Non-empty evidence never gates; children with evidence never gate;
     # metadata.superseded_by / metadata.allow_open_children="<reason>" pass.
-    if not (summary or result or "").strip():
-        if not _open_children_override_active(metadata):
-            offending_children = _open_empty_children(conn, task_id)
-            if offending_children:
-                raise OpenChildrenError(offending_children, task_id)
+    # Scoped to _COMPLETABLE_STATUSES: a terminal id falls through to the
+    # CAS noop below instead of refusing.
+    gate_open_children = (
+        not (summary or result or "").strip()
+        and not _open_children_override_active(metadata)
+    )
+    if gate_open_children and _task_status(conn, task_id) in _COMPLETABLE_STATUSES:
+        offending_children = _open_empty_children(conn, task_id)
+        if offending_children:
+            raise OpenChildrenError(offending_children, task_id)
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     metadata = _merge_completion_prose_artifacts(
@@ -2642,9 +2656,17 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        prior_status = _task_status(conn, task_id)
+        # Re-gate under the write lock (t_ca1c4a33 race): a child linked
+        # between the pre-gate read and this txn re-refuses here, before any
+        # write. Same scoping as the pre-gate; terminal ids fall through to
+        # the CAS noop. No second audit event — the refusal is the event.
+        if gate_open_children and prior_status in _COMPLETABLE_STATUSES:
+            offending_children = _open_empty_children(conn, task_id)
+            if offending_children:
+                raise OpenChildrenError(offending_children, task_id)
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
-        prior_status = _task_status(conn, task_id)
         sql = """
                 UPDATE tasks
                    SET status       = 'done',

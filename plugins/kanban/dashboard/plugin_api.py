@@ -604,7 +604,10 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
-        with _map_errors(400, _StatusRejected):
+        # OpenChildrenError (done + empty evidence + open children) is a
+        # human-actionable refusal, not a bad verb: 409 like _conflict, with
+        # the child ids + override hints the exception already carries.
+        with _map_errors(409, kanban_db.OpenChildrenError), _map_errors(400, _StatusRejected):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)

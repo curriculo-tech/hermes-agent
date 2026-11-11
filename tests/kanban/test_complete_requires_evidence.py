@@ -74,6 +74,37 @@ def test_open_child_with_empty_evidence_blocks_completion(kanban_home):
         assert kb.get_task(conn, child).status == "todo"
 
 
+def test_multiple_open_children_all_named_and_nothing_changes(kanban_home):
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent task")
+        kids = [
+            kb.create_task(conn, title=f"child task {i}", parents=[parent])
+            for i in range(2)
+        ]
+        with pytest.raises(kb.OpenChildrenError) as exc_info:
+            kb.complete_task(conn, parent)
+        msg = str(exc_info.value)
+        for kid in kids:
+            assert f"{kid} (todo)" in msg
+        assert "2 open child task(s)" in msg
+        assert kb.get_task(conn, parent).status == "ready"
+        assert all(kb.get_task(conn, kid).status == "todo" for kid in kids)
+
+
+def test_terminal_parent_with_open_child_noops_instead_of_refusing(kanban_home):
+    """Completing an already-done id is a plain noop (False) even when an open
+    evidence-less child was linked after it closed — the CAS accepts only
+    running/ready/blocked/review, so the gate must not fire for it."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent task")
+        assert kb.complete_task(conn, parent)  # done before any child exists
+        kid = kb.create_task(conn, title="late child task", parents=[parent])
+        kid_status = kb.get_task(conn, kid).status  # ready: its parent is done
+        assert kb.complete_task(conn, parent) is False
+        assert kb.get_task(conn, parent).status == "done"
+        assert kb.get_task(conn, kid).status == kid_status
+
+
 def test_blank_allow_open_children_is_not_an_override(kanban_home):
     with kbc.connect() as conn:
         parent, _child = _make_parent_with_todo_child(conn)
