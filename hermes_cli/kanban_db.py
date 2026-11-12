@@ -2529,8 +2529,94 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class OpenChildrenError(ValueError):
+    """``complete_task`` refused: the task completed with no evidence while
+    linked children that never produced any (no result, no run summary) are
+    still open. A ``ValueError`` so tool error handlers treat it as
+    recoverable; nothing was mutated (``.children`` = [(id, status), ...])."""
+
+    def __init__(self, children: list[tuple[str, str]], completing_task_id: str):
+        self.children = list(children)
+        self.completing_task_id = completing_task_id
+        listing = ", ".join(f"{cid} ({status})" for cid, status in self.children)
+        super().__init__(
+            f"completion blocked: {completing_task_id} has {len(self.children)} "
+            f"open child task(s) with no evidence: {listing}. "
+            f"Your task is still in-flight (no state change). "
+            f"Finish/start those children first, or pass "
+            f'metadata.allow_open_children="<reason>" to close anyway, or '
+            f"metadata.superseded_by when this parent is superseded."
+        )
+
+
+def _substantive_text(value: Optional[str]) -> str:
+    """``value`` with ALL whitespace stripped (``None`` -> ``""``).
+
+    SQL ``TRIM`` strips spaces only, so whitespace-only evidence (``"\\n"``,
+    ``"\\t"``) would read as substantive there; ``str.strip`` keeps this
+    symmetric with the parent-side check in :func:`complete_task`."""
+    return (value or "").strip()
+
+
+def _open_empty_children(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
+    """Linked children of ``task_id`` that are not terminal (``done`` /
+    ``archived``) AND carry no evidence: empty (or whitespace-only) ``result``
+    and an empty (or whitespace-only) ``task_runs.summary`` on EVERY run — the
+    newest substantive run summary is picked, so evidence an older run left
+    behind (a later claim's NULL summary must not erase it) still counts.
+    Returns ``[(child_id, status), ...]``; pure read. Emptiness is re-judged
+    in Python — SQL ``TRIM`` misses tabs/newlines."""
+    rows = conn.execute(
+        """
+        SELECT t.id   AS child_id,
+               t.status AS child_status,
+               t.result AS result_text,
+               (SELECT r.summary
+                  FROM task_runs r
+                 WHERE r.task_id = t.id
+                   AND TRIM(COALESCE(r.summary, ''), ' ' || char(9) || char(10) || char(13)) <> ''
+                 ORDER BY r.id DESC LIMIT 1) AS summary_text
+          FROM task_links l
+          JOIN tasks t ON t.id = l.child_id
+         WHERE l.parent_id = ?
+         ORDER BY t.id
+        """,
+        (task_id,),
+    ).fetchall()
+    return [
+        (row["child_id"], row["child_status"])
+        for row in rows
+        if row["child_status"] not in ("done", "archived")
+        and not _substantive_text(row["result_text"])
+        and not _substantive_text(row["summary_text"])
+    ]
+
+
+def _open_children_override_active(metadata: Optional[dict]) -> bool:
+    """True when ``metadata`` carries an explicit carve-out for the open-
+    children gate: a ``superseded_by`` key (supersede-close) or a non-empty
+    string ``allow_open_children`` (never default-on). Reads the plain dict,
+    not JSON."""
+    if not isinstance(metadata, dict):
+        return False
+    if "superseded_by" in metadata:
+        return True
+    allow = metadata.get("allow_open_children")
+    return isinstance(allow, str) and bool(allow.strip())
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
+
+
+# Statuses complete_task's CAS UPDATE accepts. The open-children gate is
+# scoped to these: completing an already-terminal id (done/archived) is a
+# plain noop (False), never a refusal. MUST stay identical to the status
+# list in the CAS UPDATE below — "WHERE status IN ('running', 'ready',
+# 'blocked', 'review')": drift either silently bypasses the
+# gate (a status the SQL accepts but this tuple omits) or turns a terminal
+# noop into a refusal (a status this tuple has but the SQL does not).
+_COMPLETABLE_STATUSES = ("running", "ready", "blocked", "review")
 
 
 def complete_task(
@@ -2548,11 +2634,33 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+    Completing with empty evidence while open children have none either
+    raises :class:`OpenChildrenError` (``metadata.superseded_by`` /
+    ``metadata.allow_open_children`` override). The gate only applies to the
+    statuses the CAS accepts — a terminal id noops with ``False`` — and is
+    re-checked inside the write txn so a child linked mid-call cannot slip
+    through.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    # Open-children gate (t_ca1c4a33): completing a parent with NO evidence
+    # while linked children never started (no result, no run summary, not
+    # done/archived) is refused BEFORE any write txn — nothing is mutated.
+    # Non-empty evidence never gates; children with evidence never gate;
+    # metadata.superseded_by / metadata.allow_open_children="<reason>" pass.
+    # Scoped to _COMPLETABLE_STATUSES: a terminal id falls through to the
+    # CAS noop below instead of refusing.
+    gate_open_children = (
+        not _substantive_text(summary)
+        and not _substantive_text(result)
+        and not _open_children_override_active(metadata)
+    )
+    if gate_open_children and _task_status(conn, task_id) in _COMPLETABLE_STATUSES:
+        offending_children = _open_empty_children(conn, task_id)
+        if offending_children:
+            raise OpenChildrenError(offending_children, task_id)
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     metadata = _merge_completion_prose_artifacts(
@@ -2567,9 +2675,17 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        prior_status = _task_status(conn, task_id)
+        # Re-gate under the write lock (t_ca1c4a33 race): a child linked
+        # between the pre-gate read and this txn re-refuses here, before any
+        # write. Same scoping as the pre-gate; terminal ids fall through to
+        # the CAS noop. No second audit event — the refusal is the event.
+        if gate_open_children and prior_status in _COMPLETABLE_STATUSES:
+            offending_children = _open_empty_children(conn, task_id)
+            if offending_children:
+                raise OpenChildrenError(offending_children, task_id)
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
-        prior_status = _task_status(conn, task_id)
         sql = """
                 UPDATE tasks
                    SET status       = 'done',

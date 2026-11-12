@@ -290,7 +290,7 @@ def test_reopening_parent_demotes_ready_child(client):
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "done"},
+        json={"status": "done", "result": "parent closed with setup evidence"},
     )
     assert r.status_code == 200
 
@@ -419,7 +419,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{parent_id}",
-        json={"status": "done"},
+        json={"status": "done", "result": "parent closed with setup evidence"},
     )
     assert response.status_code == 200, response.text
     with kbc.connect() as conn:
@@ -427,6 +427,36 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
         grandchild = kb.get_task(conn, grandchild_id)
         assert child is not None and child.status == "ready"
         assert grandchild is not None and grandchild.status == "todo"
+
+
+def test_dashboard_done_gate_returns_409_then_override_completes(client):
+    """The open-children evidence gate must surface at the API boundary as an
+    actionable 409 naming the open child — not an unhandled 500 — and an
+    explicit ``allow_open_children`` reason closes the parent anyway."""
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "c", "parents": [parent["id"]]},
+    ).json()["task"]
+    assert child["status"] == "todo"
+
+    refused = client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}",
+        json={"status": "done"},
+    )
+    assert refused.status_code == 409
+    detail = refused.json()["detail"]
+    assert child["id"] in detail
+    assert "(todo)" in detail
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, parent["id"]).status == "ready"
+
+    overridden = client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}",
+        json={"status": "done", "metadata": {"allow_open_children": "operator waived"}},
+    )
+    assert overridden.status_code == 200, overridden.text
+    assert overridden.json()["task"]["status"] == "done"
 
 
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
