@@ -274,3 +274,35 @@ def test_child_with_run_summary_evidence_does_not_block_parent_completion(kanban
         assert kb.complete_task(conn, parent)
         assert kb.get_task(conn, parent).status == "done"
         assert kb.get_task(conn, child).status == "running"
+
+
+# ---------------------------------------------------------------------------
+# H: whitespace-only evidence is NOT evidence (SQL TRIM strips spaces only)
+# ---------------------------------------------------------------------------
+
+
+def test_whitespace_only_child_evidence_still_blocks(kanban_home):
+    """Regression: a running child whose ``tasks.result`` is ``"\\n\\t "`` and
+    whose latest ``task_runs.summary`` is ``"\\t\\n"`` carries no evidence —
+    SQL ``TRIM`` used to read those as substantive, a fail-open asymmetry
+    with the parent-side ``str.strip`` check. Gate must refuse and name the
+    child with no state change."""
+    with kbc.connect() as conn:
+        parent, child = _make_parent_with_running_child(conn)
+        started = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET result = ? WHERE id = ?", ("\n\t ", child),
+        )
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, summary, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?, ?)",
+            (child, "\t\n", started, started + 60),
+        )
+        conn.commit()
+        with pytest.raises(kb.OpenChildrenError) as exc_info:
+            kb.complete_task(conn, parent)
+        assert child in str(exc_info.value)
+        # Refused before any write txn: nothing changed.
+        assert kb.get_task(conn, parent).status == "ready"
+        assert kb.get_task(conn, child).status == "running"

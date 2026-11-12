@@ -2549,16 +2549,27 @@ class OpenChildrenError(ValueError):
         )
 
 
+def _substantive_text(value: Optional[str]) -> str:
+    """``value`` with ALL whitespace stripped (``None`` -> ``""``).
+
+    SQL ``TRIM`` strips spaces only, so whitespace-only evidence (``"\\n"``,
+    ``"\\t"``) would read as substantive there; ``str.strip`` keeps this
+    symmetric with the parent-side check in :func:`complete_task`."""
+    return (value or "").strip()
+
+
 def _open_empty_children(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
     """Linked children of ``task_id`` that are not terminal (``done`` /
-    ``archived``) AND carry no evidence: empty ``result`` and an empty latest
-    ``task_runs.summary``. Returns ``[(child_id, status), ...]``; pure read."""
+    ``archived``) AND carry no evidence: empty (or whitespace-only) ``result``
+    and an empty latest ``task_runs.summary``. Returns ``[(child_id, status),
+    ...]``; pure read. Emptiness is judged in Python — SQL ``TRIM`` misses
+    tabs/newlines."""
     rows = conn.execute(
         """
         SELECT t.id   AS child_id,
                t.status AS child_status,
-               TRIM(COALESCE(t.result, '')) AS result_text,
-               (SELECT TRIM(COALESCE(r.summary, ''))
+               t.result AS result_text,
+               (SELECT r.summary
                   FROM task_runs r
                  WHERE r.task_id = t.id
                  ORDER BY r.id DESC LIMIT 1) AS summary_text
@@ -2573,8 +2584,8 @@ def _open_empty_children(conn: sqlite3.Connection, task_id: str) -> list[tuple[s
         (row["child_id"], row["child_status"])
         for row in rows
         if row["child_status"] not in ("done", "archived")
-        and not row["result_text"]
-        and not row["summary_text"]
+        and not _substantive_text(row["result_text"])
+        and not _substantive_text(row["summary_text"])
     ]
 
 
