@@ -604,7 +604,7 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
-        with _map_errors(400, _StatusRejected):
+        with _map_errors(400, _StatusRejected, kanban_db.OpenChildrenEvidenceError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)
@@ -776,13 +776,19 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: 
 
 def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
-    remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
+    remaining ops — except a rejected status verb (``_StatusRejected`` propagates; the evidence
+    gate's :class:`OpenChildrenEvidenceError` is recorded per-task below)."""
     if payload.archive and not kanban_db.archive_task(conn, tid):
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:
         s = payload.status
-        if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
-            entry.update(ok=False, error=f"transition to {s!r} refused")
+        try:
+            if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
+                entry.update(ok=False, error=f"transition to {s!r} refused")
+        except kanban_db.OpenChildrenEvidenceError as e:
+            # Parent has open evidence-less children: refuse THIS task, keep
+            # the batch going (ids are named in the error message).
+            entry.update(ok=False, error=str(e))
     if payload.assignee is not None:
         try:
             ok = (kanban_db.reassign_task(conn, tid, payload.assignee or None, reclaim_first=True) if payload.reclaim_first

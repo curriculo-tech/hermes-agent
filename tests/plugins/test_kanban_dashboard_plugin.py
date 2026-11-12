@@ -290,7 +290,10 @@ def test_reopening_parent_demotes_ready_child(client):
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "done"},
+        json={
+            "status": "done",
+            "metadata": {"allow_open_children": "child work continues after parent close"},
+        },
     )
     assert r.status_code == 200
 
@@ -419,7 +422,10 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{parent_id}",
-        json={"status": "done"},
+        json={
+            "status": "done",
+            "metadata": {"allow_open_children": "operator re-closes parent; children still open"},
+        },
     )
     assert response.status_code == 200, response.text
     with kbc.connect() as conn:
@@ -427,6 +433,61 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
         grandchild = kb.get_task(conn, grandchild_id)
         assert child is not None and child.status == "ready"
         assert grandchild is not None and grandchild.status == "todo"
+
+
+def test_completing_parent_with_open_evidence_less_child_is_rejected(client):
+    """Evidence gate over HTTP: PATCH {"status": "done"} on a parent with an
+    open evidence-less child is a 400 naming the child (was a 500 before the
+    error mapping), and the parent stays in flight."""
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "c", "parents": [parent["id"]]},
+    ).json()["task"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}",
+        json={"status": "done"},
+    )
+    assert r.status_code == 400
+    assert child["id"] in r.json()["detail"]
+
+    parent_after = client.get(
+        f"/api/plugins/kanban/tasks/{parent['id']}"
+    ).json()["task"]
+    assert parent_after["status"] != "done"
+
+
+def test_bulk_done_maps_evidence_gate_refusal_per_task(client):
+    """Bulk evidence gate: a gated parent in the batch gets ``ok == False``
+    with the open child named in ``error`` (HTTP stays 200), while the
+    unrelated sibling still transitions to done."""
+    gated = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "c", "parents": [gated["id"]]},
+    ).json()["task"]
+    bystander = client.post("/api/plugins/kanban/tasks", json={"title": "u"}).json()["task"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [gated["id"], bystander["id"]], "status": "done"},
+    )
+
+    assert r.status_code == 200
+    results = {entry["id"]: entry for entry in r.json()["results"]}
+    assert results[gated["id"]]["ok"] is False
+    assert child["id"] in results[gated["id"]]["error"]
+    assert results[bystander["id"]]["ok"] is True
+
+    gated_after = client.get(
+        f"/api/plugins/kanban/tasks/{gated['id']}"
+    ).json()["task"]
+    bystander_after = client.get(
+        f"/api/plugins/kanban/tasks/{bystander['id']}"
+    ).json()["task"]
+    assert gated_after["status"] != "done"
+    assert bystander_after["status"] == "done"
 
 
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):

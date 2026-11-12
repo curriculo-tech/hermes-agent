@@ -608,6 +608,20 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"in-flight (no state change). Retry kanban_complete with the same "
                 f"summary/metadata and either drop these ids from created_cards, or pass "
                 f"created_cards=[] to skip the card-claim check entirely.")
+        except kb.OpenChildrenEvidenceError as ev_err:
+            # Same pre-txn gate pattern: the task was NOT mutated and stays in
+            # flight. Name the offending children and the two sanctioned
+            # escape hatches so the worker can act without guessing.
+            children = ", ".join(
+                f"{child['id']} ({child['status']})" for child in ev_err.children)
+            return tool_error(
+                f"kanban_complete blocked: no result/summary evidence while these "
+                f"open children have no evidence either: {children}. The task was "
+                f"NOT mutated and is still in-flight. Finish or close those "
+                f"children first (complete them with a summary), or retry "
+                f'kanban_complete with metadata={{"allow_open_children": "<reason>"}} '
+                f'to override, or metadata={{"superseded_by": "<card-id>"}} when the '
+                f"child was superseded.")
         task = kb.get_task(conn, tid)
         _check(ok, (task.last_failure_error if task else None) or
                f"could not complete {tid} (unknown id, stale run, or already terminal)")
