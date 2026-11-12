@@ -2561,9 +2561,11 @@ def _substantive_text(value: Optional[str]) -> str:
 def _open_empty_children(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
     """Linked children of ``task_id`` that are not terminal (``done`` /
     ``archived``) AND carry no evidence: empty (or whitespace-only) ``result``
-    and an empty latest ``task_runs.summary``. Returns ``[(child_id, status),
-    ...]``; pure read. Emptiness is judged in Python — SQL ``TRIM`` misses
-    tabs/newlines."""
+    and an empty (or whitespace-only) ``task_runs.summary`` on EVERY run — the
+    newest substantive run summary is picked, so evidence an older run left
+    behind (a later claim's NULL summary must not erase it) still counts.
+    Returns ``[(child_id, status), ...]``; pure read. Emptiness is re-judged
+    in Python — SQL ``TRIM`` misses tabs/newlines."""
     rows = conn.execute(
         """
         SELECT t.id   AS child_id,
@@ -2572,6 +2574,7 @@ def _open_empty_children(conn: sqlite3.Connection, task_id: str) -> list[tuple[s
                (SELECT r.summary
                   FROM task_runs r
                  WHERE r.task_id = t.id
+                   AND TRIM(COALESCE(r.summary, ''), ' ' || char(9) || char(10) || char(13)) <> ''
                  ORDER BY r.id DESC LIMIT 1) AS summary_text
           FROM task_links l
           JOIN tasks t ON t.id = l.child_id

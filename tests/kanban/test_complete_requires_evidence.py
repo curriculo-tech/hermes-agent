@@ -1,8 +1,8 @@
 """Open-children gate on ``complete_task`` (loop-gate-noop, t_ca1c4a33).
 
 A parent may not complete with NO evidence while linked children that never
-started (not done/archived, empty result, empty latest-run summary) are open —
-unless ``metadata.superseded_by`` or a non-empty string
+started (not done/archived, empty result, no substantive summary on ANY run) are
+open — unless ``metadata.superseded_by`` or a non-empty string
 ``metadata.allow_open_children`` carries an explicit carve-out.
 """
 
@@ -297,6 +297,42 @@ def test_child_with_run_summary_evidence_does_not_block_parent_completion(kanban
         assert kb.complete_task(conn, parent)
         assert kb.get_task(conn, parent).status == "done"
         assert kb.get_task(conn, child).status == "running"
+
+
+def test_child_with_evidence_in_older_run_does_not_block(kanban_home):
+    """Evidence survives a later empty run: the child was claimed, its first
+    run ended with a substantive summary (the ``block_task`` handoff path),
+    then it was re-claimed and the NEWER run's summary is NULL while
+    ``tasks.result`` stays NULL. Reading only the LATEST run's summary would
+    judge the child evidence-less and refuse the empty-handed parent; the
+    gate must count evidence from ANY run — the newest substantive run
+    summary. Old behavior this pins out: ``ORDER BY r.id DESC LIMIT 1``
+    without the substantive filter raises ``OpenChildrenError``."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent task")
+        child = kb.create_task(conn, title="child task", parents=[parent])
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child,))
+        started = int(time.time())
+        # Run #1: ends blocked with a substantive summary (evidence).
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, summary, started_at, ended_at) "
+            "VALUES (?, 'blocked', 'blocked', ?, ?, ?)",
+            (child, "blocked: waiting on X", started, started + 60),
+        )
+        # Run #2: re-claim; newer id, summary NULL, still running.
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, summary, started_at) "
+            "VALUES (?, 'running', NULL, ?)",
+            (child, started + 120),
+        )
+        conn.commit()
+        assert kb.get_task(conn, child).result is None
+        # Must COMPLETE (a raise here is the old latest-run-only defect).
+        assert kb.complete_task(conn, parent)
+        assert kb.get_task(conn, parent).status == "done"
+        # Child stays non-terminal: its older-run evidence gates nothing.
+        assert kb.get_task(conn, child).status == "ready"
 
 
 # ---------------------------------------------------------------------------
