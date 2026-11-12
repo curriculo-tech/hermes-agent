@@ -8,6 +8,7 @@ unless ``metadata.superseded_by`` or a non-empty string
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -328,3 +329,52 @@ def test_whitespace_only_child_evidence_still_blocks(kanban_home):
         # Refused before any write txn: nothing changed.
         assert kb.get_task(conn, parent).status == "ready"
         assert kb.get_task(conn, child).status == "running"
+
+
+# ---------------------------------------------------------------------------
+# I: kanban_complete tool maps the refusal to a recoverable tool_error
+# ---------------------------------------------------------------------------
+
+
+def test_tool_complete_open_child_returns_tool_error(kanban_home, monkeypatch):
+    """The ``kanban_complete`` tool must map ``OpenChildrenError`` to a
+    recoverable ``tool_error`` payload (structured JSON naming the child),
+    not raise, not return ``ok`` — and the refusal mutates nothing.
+
+    ``_handle_complete`` itself demands a non-empty summary-or-result
+    (tools/kanban_tools.py ``_check(summary or result, ...)``), so a
+    whitespace-only summary is the only call shape that reaches the kernel
+    gate from the tool; the kernel's gate treats it as substantively empty
+    and must still refuse. Worker env mirrors the ``worker_env`` fixture in
+    tests/tools/test_kanban_tools.py."""
+    from tools import kanban_tools as kt
+
+    with kbc.connect() as conn:
+        parent, child = _make_parent_with_todo_child(conn)
+
+    for name in (
+        "HERMES_SESSION_ID",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_HOME",
+        "HERMES_DELEGATED_CHILD_CONTEXT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
+
+    out = kt._handle_complete({"summary": " ", "result": ""})
+    d = json.loads(out)
+    assert "error" in d, out
+    assert "ok" not in d, out
+    msg = d["error"]
+    # The dedicated mapping, not the decorator's generic exception fallback
+    # (which would read "kanban_complete: ...").
+    assert "kanban_complete blocked" in msg
+    assert f"{child} (todo)" in msg
+    assert parent in msg
+
+    # Refusal mutated nothing: parent is still open, child still todo.
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, parent).status == "ready"
+        assert kb.get_task(conn, child).status == "todo"
