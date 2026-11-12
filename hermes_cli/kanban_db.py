@@ -2610,7 +2610,7 @@ class ArtifactPreservationError(RuntimeError):
 # scoped to these: completing an already-terminal id (done/archived) is a
 # plain noop (False), never a refusal. MUST stay identical to the status
 # list in the CAS UPDATE below — "WHERE status IN ('running', 'ready',
-# 'blocked', 'review')" (~line 2681): drift either silently bypasses the
+# 'blocked', 'review')": drift either silently bypasses the
 # gate (a status the SQL accepts but this tuple omits) or turns a terminal
 # noop into a refusal (a status this tuple has but the SQL does not).
 _COMPLETABLE_STATUSES = ("running", "ready", "blocked", "review")
@@ -2650,7 +2650,8 @@ def complete_task(
     # Scoped to _COMPLETABLE_STATUSES: a terminal id falls through to the
     # CAS noop below instead of refusing.
     gate_open_children = (
-        not (summary or result or "").strip()
+        not _substantive_text(summary)
+        and not _substantive_text(result)
         and not _open_children_override_active(metadata)
     )
     if gate_open_children and _task_status(conn, task_id) in _COMPLETABLE_STATUSES:

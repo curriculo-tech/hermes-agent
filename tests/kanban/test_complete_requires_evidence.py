@@ -137,6 +137,28 @@ def test_nonempty_evidence_with_open_child_completes(kanban_home):
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_blank_summary_but_real_result_completes(kanban_home):
+    """Regression (loop-gate-noop): the gate used ``not (summary or
+    result or "").strip()``, and ``summary or result`` takes the FIRST
+    truthy value — a whitespace-only ``summary`` shadowed a substantive
+    ``result`` and refused an evidenced completion. Either field carrying
+    evidence must pass; gate only when BOTH are substantively empty."""
+    with kbc.connect() as conn:
+        parent, _child = _make_parent_with_todo_child(conn)
+        assert kb.complete_task(conn, parent, summary="  ", result="evidence")
+        assert kb.get_task(conn, parent).status == "done"
+        assert kb.get_task(conn, parent).result == "evidence"
+
+
+def test_real_summary_but_blank_result_completes(kanban_home):
+    """Mirror of the regression above: the evidence rides in ``summary``
+    while ``result`` is whitespace-only — must complete, not gate."""
+    with kbc.connect() as conn:
+        parent, _child = _make_parent_with_todo_child(conn)
+        assert kb.complete_task(conn, parent, summary="evidence", result="  ")
+        assert kb.get_task(conn, parent).status == "done"
+
+
 # ---------------------------------------------------------------------------
 # B: explicit allow_open_children override
 # ---------------------------------------------------------------------------
