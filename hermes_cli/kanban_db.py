@@ -2533,6 +2533,104 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class OpenChildrenEvidenceError(ValueError):
+    """``complete_task`` refused: the parent carries no completion evidence
+    (empty ``result`` AND empty ``summary``) while at least one child is still
+    open (not ``done``/``archived``) and itself has no evidence (NULL/blank
+    ``result`` and no non-empty run summary). A ``ValueError`` so tool error
+    handlers treat it as recoverable; ``.children`` carries the offending
+    ``{"id", "status"}`` pairs so callers can name every blocker."""
+
+    def __init__(self, parent_id: str, children: list[dict]):
+        self.parent_id = parent_id
+        self.children = list(children)
+        listed = ", ".join(
+            f"{child['id']} ({child['status']})" for child in self.children
+        )
+        super().__init__(
+            f"completion blocked: {parent_id} has no result/summary evidence "
+            f"while open children without evidence remain: {listed}. "
+            f'Pass metadata={{"allow_open_children": "<reason>"}} to override, or '
+            f'metadata={{"superseded_by": "<card-id>"}} when the child was superseded.'
+        )
+
+
+def _open_children_without_evidence(
+    conn: sqlite3.Connection, task_id: str,
+) -> list[dict]:
+    """Children of ``task_id`` that are open (status not ``done``/``archived``)
+    AND evidence-less (``result`` NULL/blank and :func:`latest_summary` empty)
+    — the un-started children that make an empty-evidence parent completion a
+    silent no-op. Returns ``[{"id", "status"}, ...]`` ordered by id; child
+    summaries come from ONE :func:`latest_summaries` query and child rows
+    from ONE ``id IN (...)`` fetch (no per-child round-trip) over the
+    existing schema."""
+    ids = child_ids(conn, task_id)
+    if not ids:
+        return []
+    summaries = latest_summaries(conn, ids)
+    placeholders = ",".join("?" for _ in ids)
+    rows = {
+        row["id"]: row
+        for row in conn.execute(
+            f"SELECT id, status, result FROM tasks WHERE id IN ({placeholders})",
+            ids,
+        )
+    }
+    offenders: list[dict] = []
+    for child_id in ids:
+        row = rows.get(child_id)  # dangling link: no tasks row, skip
+        if row is None or row["status"] in ("done", "archived"):
+            continue
+        if (row["result"] or "").strip():
+            continue
+        if (summaries.get(child_id) or "").strip():
+            continue
+        offenders.append({"id": row["id"], "status": row["status"]})
+    offenders.sort(key=lambda child: child["id"])
+    return offenders
+
+
+def _gate_open_children_evidence(
+    conn: sqlite3.Connection, task_id: str, result: Optional[str],
+    summary: Optional[str], metadata: Any,
+) -> Optional[str]:
+    """Reject an EMPTY-EVIDENCE parent ``complete`` while un-started children
+    exist (loop-gate-noop). Returns the stripped ``allow_open_children``
+    reason ONLY when the gate was consulted and that override let the
+    completion through; ``None`` on every other pass (audit key stays off).
+
+    Status guard: only ``running|ready|blocked|review`` can complete, so any
+    other status (an already-``done`` re-complete, ``todo``, ...) skips the
+    gate and ``complete_task`` keeps returning ``False`` — never raises.
+    Locked reading of "never reject non-empty results": the gate fires only
+    when the PARENT's own ``result`` and ``summary`` are both empty — a parent
+    completing with real evidence always passes, even with open children.
+    Carve-outs: ``metadata["superseded_by"]`` (non-empty string naming the
+    superseding card, mirroring ``allow_open_children`` — ``""``/``None`` and
+    non-strings like ``0``/``False``/``[]``/``{}`` do NOT pass; child was
+    superseded) and ``metadata["allow_open_children"]`` (explicit non-empty
+    string override; never default-on). Raises pre-txn so the task is left
+    unmutated (same pattern as the hallucination gate); the in-txn re-run
+    closes the child-added-while-completing race."""
+    status = _task_status(conn, task_id)
+    if status not in ("running", "ready", "blocked", "review"):
+        return None
+    if (result or "").strip() or (summary or "").strip():
+        return None
+    open_empty = _open_children_without_evidence(conn, task_id)
+    if not open_empty:
+        return None
+    if isinstance(metadata, dict):
+        supersede = metadata.get("superseded_by")
+        if isinstance(supersede, str) and supersede.strip():
+            return None
+        allow = metadata.get("allow_open_children")
+        if isinstance(allow, str) and allow.strip():
+            return allow.strip()
+    raise OpenChildrenEvidenceError(task_id, open_empty)
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2555,6 +2653,10 @@ def complete_task(
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
+    # Empty-evidence parent + un-started children -> structured refusal.
+    # After the phantom-card gate so its rejection (and audit event) keep
+    # precedence; re-run in-txn below closes the race.
+    _gate_open_children_evidence(conn, task_id, result, summary, metadata)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -2567,6 +2669,14 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        # Race-closing re-run (child linked while we waited): the in-txn
+        # return value is the authoritative audit reason; raising here rolls
+        # back cleanly — this txn has not yet touched the task row or its
+        # runs (a PR contract bound earlier by ``prepare_acceptance`` in its
+        # own committed txn stays put and is idempotent on retry).
+        allow_open_children_reason = _gate_open_children_evidence(
+            conn, task_id, result, summary, metadata,
+        )
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         prior_status = _task_status(conn, task_id)
@@ -2609,7 +2719,10 @@ def complete_task(
             event_summary = _REVIEW_APPROVED_NOTE
         _append_event(
             conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
+            _completed_event_payload(
+                result, event_summary, verified_cards, metadata,
+                allow_open_children_reason=allow_open_children_reason,
+            ),
             run_id=run_id,
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
@@ -2678,11 +2791,15 @@ def _cleaned_artifact_paths(metadata: Any) -> list[str]:
 
 def _completed_event_payload(
     result: Optional[str], event_summary: Optional[str], verified_cards: list[str], metadata: Any,
+    allow_open_children_reason: Optional[str] = None,
 ) -> dict:
     """``completed`` event payload: first summary line (400 chars) so gateway
     notifiers / dashboard WS render without a second round-trip; verified
     cards; and ``metadata["artifacts"]`` promoted so the notifier can upload
-    them as native attachments without fetching the run row."""
+    them as native attachments without fetching the run row.
+    ``allow_open_children_reason`` comes from the in-txn evidence-gate run —
+    the completion was allowed despite open children; record why (audit key
+    only ever present on a genuine override)."""
     # Mirror CLI's _show_voice_status: include STT/TTS provider availability so the user can tell at a
     # glance *why* voice mode isn't working ("STT provider: MISSING ..." is the common case). ``record_key``
     # mirrors the configured ``voice.record_key`` so the TUI can both bind it (frontend
@@ -2698,6 +2815,10 @@ def _completed_event_payload(
         cleaned = _cleaned_artifact_paths(metadata)
         if cleaned:
             payload["artifacts"] = cleaned
+    # Audit trail for the open-children override (loop-gate-noop): the gate
+    # itself supplies the reason (or None); metadata is never consulted here.
+    if allow_open_children_reason:
+        payload["allow_open_children_reason"] = allow_open_children_reason
     return payload
 
 

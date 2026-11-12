@@ -216,7 +216,12 @@ def test_review_changes_reapply_parent_gate(conn):
 
     # Move the task through review while its parent is temporarily terminal,
     # then make the parent non-terminal again before changes are requested.
-    assert kb.complete_task(conn, parent_id)
+    # (allow_open_children: this empty planner close predates the open-children
+    # evidence gate — decomposition scaffolding, not a worker no-op complete.)
+    assert kb.complete_task(
+        conn, parent_id,
+        metadata={"allow_open_children": "planner parent closed with work delegated to children"},
+    )
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
     assert kb.request_review(
@@ -264,7 +269,12 @@ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
     still_running = kb.get_task(conn, task_id)
     assert still_running is not None
     assert still_running.status == "running"
-    assert kb.complete_task(conn, parent_id)
+    # (allow_open_children: empty re-close of the reopened parent while its
+    # child is mid-run — sanctioned override, not a worker no-op complete.)
+    assert kb.complete_task(
+        conn, parent_id,
+        metadata={"allow_open_children": "reopened parent re-closed while child mid-run"},
+    )
     assert kb.request_review(
         conn,
         task_id,
