@@ -278,7 +278,11 @@ def test_parent_worktree_deferred_until_children_done(
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
         assert kb.claim_task(conn, parent, claimer="worker") is not None
-        assert kb.complete_task(conn, parent, summary="parent done")
+        # Explicit opt-in: the open-children gate rejects un-started, evidence-less children unless the caller overrides — this parent handoff defers the sweep.
+        assert kb.complete_task(
+            conn, parent, summary="parent done",
+            metadata={"allow_open_children": "deferred workspace sweep handoff"},
+        )
         # child still active -> parent worktree must survive for handoff
         assert parent_wt.is_dir()
 
@@ -351,7 +355,11 @@ def test_terminal_scratch_parent_still_swept_after_last_child(
         (ws / "handoff.txt").write_text("x", encoding="utf-8")
         child = kb.create_task(conn, title="probe")
         kb.link_tasks(conn, parent, child)
-        assert kb.complete_task(conn, parent, summary="parent done")
+        # Explicit opt-in: the open-children gate rejects un-started, evidence-less children unless the caller overrides — this parent handoff defers the sweep.
+        assert kb.complete_task(
+            conn, parent, summary="parent done",
+            metadata={"allow_open_children": "deferred workspace sweep handoff"},
+        )
         assert ws.is_dir()  # live child still needs the handoff files
         assert kb.archive_task(conn, child)
     assert not ws.exists()

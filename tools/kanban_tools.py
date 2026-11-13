@@ -784,6 +784,18 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"kanban_complete blocked: {empty_err}. Your task is still in-flight (no state "
                 f"change). Retry kanban_complete with a non-empty summary or result describing "
                 f"what was done.")
+        except kb.OpenChildrenWithoutEvidenceError as open_err:
+            # Same contract: the gate runs before the write txn, so the task was
+            # NOT mutated. Name the two ways forward (finish/unlink the children,
+            # or the explicit override metadata) or the model stalls instead of
+            # retrying.
+            return tool_error(
+                f"kanban_complete blocked: {open_err}. Your task is still "
+                f"in-flight (no state change). Finish or unlink those child "
+                f"cards first, or retry kanban_complete with "
+                f'metadata={{"allow_open_children": "<reason>"}} to close this '
+                f'card anyway (or metadata={{"superseded_by": "<card_id>"}} '
+                f"when this card was superseded).")
         task = kb.get_task(conn, tid)
         if not ok:
             # complete_task reports every refusal as bare False; a reopened or

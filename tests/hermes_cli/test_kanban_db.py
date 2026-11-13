@@ -931,7 +931,11 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
         parent_ws = kbw.resolve_workspace(p_task)
         kbw.set_workspace_path(conn, parent, parent_ws)
 
-        kb.complete_task(conn, parent, result="handoff")
+        # Explicit opt-in: the open-children gate rejects un-started, evidence-less children unless the caller overrides — this parent handoff defers the sweep.
+        kb.complete_task(
+            conn, parent, result="handoff",
+            metadata={"allow_open_children": "deferred workspace sweep handoff"},
+        )
         assert parent_ws.exists(), "deferred while dir child active"
 
         kb.complete_task(conn, child, result="built")

@@ -225,11 +225,12 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
             synthesizer_assignee="writer",
         )
 
+        # Override is explicit: this test deliberately closes the worker while its verifier child is still open.
         kb.complete_task(
             conn,
             created.worker_ids[0],
             summary="A done",
-            metadata={"confidence": 0.8},
+            metadata={"confidence": 0.8, "allow_open_children": "verifier child gated on branch B"},
         )
         kb.recompute_ready(conn)
         verifier = kb.get_task(conn, created.verifier_id)
@@ -239,7 +240,13 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
         assert verifier.status == "todo"
         assert synthesizer.status == "todo"
 
-        kb.complete_task(conn, created.worker_ids[1], summary="B done")
+        # Override is explicit: this test deliberately closes the worker while its verifier child is still open.
+        kb.complete_task(
+            conn,
+            created.worker_ids[1],
+            summary="B done",
+            metadata={"allow_open_children": "verifier child still unstarted"},
+        )
         kb.recompute_ready(conn)
         verifier = kb.get_task(conn, created.verifier_id)
         synthesizer = kb.get_task(conn, created.synthesizer_id)
@@ -248,15 +255,45 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
         assert verifier.status == "ready"
         assert synthesizer.status == "todo"
 
+        # Override is explicit: this test deliberately closes the verifier while its synthesizer child is still open.
         kb.complete_task(
             conn,
             created.verifier_id,
             summary="Verified both branches",
-            metadata={"gate": "pass"},
+            metadata={"gate": "pass", "allow_open_children": "synthesizer child still unstarted"},
         )
         kb.recompute_ready(conn)
         synthesizer = kb.get_task(conn, created.synthesizer_id)
         assert synthesizer is not None
         assert synthesizer.status == "ready"
+    finally:
+        conn.close()
+
+
+def test_swarm_stage_bodies_teach_allow_open_children_override(tmp_path):
+    """Every stage card teaches the agent the open-children escape hatch.
+
+    Each stage's completion is gated on its un-started child (the next
+    stage), so without the hint baked into the card body the swarm
+    deadlocks at the first worker handoff: the worker's kernel refuses
+    the completion while the verifier/synthesizer child is un-started.
+    """
+    conn = kbc.connect(tmp_path / "kanban.db")
+    try:
+        created = create_swarm(
+            conn,
+            goal="Every stage card teaches the open-children override.",
+            workers=[
+                SwarmWorkerSpec(profile="researcher", title="Evidence", body="Find proof"),
+            ],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+        )
+        stage_ids = [
+            *created.worker_ids, created.verifier_id, created.synthesizer_id,
+        ]
+        for tid in stage_ids:
+            body = kb.get_task(conn, tid).body or ""
+            assert "allow_open_children" in body, f"card {tid} body lacks the override hint"
     finally:
         conn.close()

@@ -25,6 +25,16 @@ from hermes_cli import kanban_db as kb
 
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
 
+# Loop-gate escape hatch: each stage card's completion is gated on its
+# un-started child (the next stage), so every agent holding a swarm card must
+# know the override or the swarm deadlocks at the first worker handoff.
+_OPEN_CHILD_OVERRIDE_HINT = (
+    "\nWhen you complete this card, pass completion metadata "
+    '{"allow_open_children": "<short reason>"}: this swarm links the next '
+    "stage as a child of this card, so the kernel would otherwise refuse "
+    "your completion while that child is still un-started."
+)
+
 
 @dataclass(frozen=True)
 class SwarmWorkerSpec:
@@ -213,7 +223,7 @@ def _create_swarm_uncommitted(
         kb.create_task(
             conn,
             title=spec.title,
-            body=(spec.body or "") + context_suffix,
+            body=(spec.body or "") + context_suffix + _OPEN_CHILD_OVERRIDE_HINT,
             assignee=spec.profile,
             parents=[root],
             priority=spec.priority or priority,
@@ -231,6 +241,7 @@ def _create_swarm_uncommitted(
             "complete only with metadata {\"gate\": \"pass\"} when evidence is "
             "sufficient; otherwise block with exact missing work."
             + context_suffix
+            + _OPEN_CHILD_OVERRIDE_HINT
         ),
         assignee=verifier_assignee,
         parents=worker_ids,
@@ -245,6 +256,7 @@ def _create_swarm_uncommitted(
             "Synthesize the verified worker outputs into the final deliverable. "
             "Do not start until the verifier has passed the gate."
             + context_suffix
+            + _OPEN_CHILD_OVERRIDE_HINT
         ),
         assignee=synthesizer_assignee,
         parents=[verifier],
