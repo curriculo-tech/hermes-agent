@@ -228,3 +228,18 @@ def test_allow_open_children_requires_nonempty_string(conn, bad_override):
             metadata={"allow_open_children": bad_override},
         )
     assert kb.get_task(conn, parent).status == "running"
+
+
+def test_review_parent_with_open_child_still_approved(conn):
+    """Human review approval stays exempt: approving a ``review`` parent with
+    open, evidence-less children must complete (the human is the record), and
+    the gate must not write a blocked event."""
+    parent = kb.create_task(conn, title="parent", assignee="coder")
+    assert kb.claim_task(conn, parent, claimer=kb._claimer_id()) is not None
+    kb.create_task(conn, title="child", assignee="coder", parents=[parent])
+    conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (parent,))
+    conn.commit()
+    assert kb.get_task(conn, parent).status == "review"
+    assert kb.complete_task(conn, parent) is True
+    assert kb.get_task(conn, parent).status == "done"
+    assert "completion_blocked_open_children" not in _event_kinds(conn, parent)
