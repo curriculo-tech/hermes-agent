@@ -177,3 +177,54 @@ def test_integration_scratch_db(tmp_path, monkeypatch):
         kinds = _event_kinds(conn, parent)
         assert "completion_blocked_open_children" in kinds
         assert "completed" in kinds
+
+
+def test_open_child_with_result_evidence_not_gated(conn):
+    """Never reject non-empty evidence: an open child carrying a substantive
+    ``tasks.result`` exempts it from the gate."""
+    parent = kb.create_task(conn, title="parent", assignee="coder")
+    assert kb.claim_task(conn, parent, claimer=kb._claimer_id()) is not None
+    child = kb.create_task(conn, title="child", assignee="coder")
+    conn.execute("UPDATE tasks SET result = ? WHERE id = ?", ("child shipped its slice", child))
+    conn.commit()
+    assert kb.link_tasks(conn, parent, child) is not None
+    assert kb.complete_task(conn, parent, summary="child carried the evidence") is True
+    assert kb.get_task(conn, parent).status == "done"
+    assert "completion_blocked_open_children" not in _event_kinds(conn, parent)
+
+
+def test_open_child_summary_only_evidence_not_gated(conn):
+    """A closed run summary counts as evidence even with an empty task result."""
+    parent = kb.create_task(conn, title="parent", assignee="coder")
+    assert kb.claim_task(conn, parent, claimer=kb._claimer_id()) is not None
+    child = kb.create_task(conn, title="child", assignee="coder")
+    assert kb.claim_task(conn, child, claimer=kb._claimer_id()) is not None
+    assert kb.complete_task(conn, child, summary="evidence: reviewed") is True
+    conn.execute("UPDATE tasks SET status = 'todo', result = '' WHERE id = ?", (child,))
+    conn.commit()
+    assert kb.link_tasks(conn, parent, child) is not None
+    assert kb.complete_task(conn, parent, summary="child evidence lives in its run summary") is True
+    assert kb.get_task(conn, parent).status == "done"
+
+
+def test_archived_child_not_gated(conn):
+    parent = kb.create_task(conn, title="parent", assignee="coder")
+    assert kb.claim_task(conn, parent, claimer=kb._claimer_id()) is not None
+    child = kb.create_task(conn, title="child", assignee="coder")
+    conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (child,))
+    conn.commit()
+    assert kb.link_tasks(conn, parent, child) is not None
+    assert kb.complete_task(conn, parent, summary="archived child needs no evidence") is True
+    assert kb.get_task(conn, parent).status == "done"
+
+
+@pytest.mark.parametrize("bad_override", ["", "   ", 0, False, ["reason"]])
+def test_allow_open_children_requires_nonempty_string(conn, bad_override):
+    """Override is opt-in and must be an explicit non-empty string reason."""
+    parent, _kids = _parent_with_open_children(conn)
+    with pytest.raises(kb.OpenChildrenWithoutEvidenceError):
+        kb.complete_task(
+            conn, parent, summary="closing early",
+            metadata={"allow_open_children": bad_override},
+        )
+    assert kb.get_task(conn, parent).status == "running"
