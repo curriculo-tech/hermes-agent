@@ -2604,6 +2604,20 @@ class EmptyCompletionError(ValueError):
         )
 
 
+class OpenChildrenCompletionError(EmptyCompletionError):
+    """``complete_task`` refused: open children have no completion evidence."""
+
+    def __init__(self, task_id: str, children: list[tuple[str, str]]):
+        self.task_id = task_id
+        self.children = list(children)
+        detail = ", ".join(f"{child_id} ({status})" for child_id, status in children)
+        ValueError.__init__(
+            self,
+            f"completion blocked: {task_id} has open children without result or "
+            f"summary evidence: {detail}",
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -2666,7 +2680,9 @@ def complete_task(
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
-    _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    _gate_empty_completion(
+        conn, task_id, result=result, summary=summary, metadata=metadata
+    )
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -2780,6 +2796,7 @@ def _gate_empty_completion(
     *,
     result: Optional[str],
     summary: Optional[str],
+    metadata: Optional[dict],
 ) -> None:
     """Refuse a completion that would leave the card with no evidence.
 
@@ -2797,6 +2814,49 @@ def _gate_empty_completion(
     stored = row["result"]
     if _substantive_text(result) or _substantive_text(summary) or _substantive_text(stored):
         return
+
+    children = conn.execute(
+        "SELECT c.id, c.status FROM task_links l "
+        "JOIN tasks c ON c.id = l.child_id "
+        "WHERE l.parent_id = ? ORDER BY c.id",
+        (task_id,),
+    ).fetchall()
+    if children:
+        open_empty = conn.execute(
+            "SELECT c.id, c.status FROM task_links l "
+            "JOIN tasks c ON c.id = l.child_id "
+            "WHERE l.parent_id = ? AND c.status NOT IN ('done', 'archived') "
+            "AND COALESCE(TRIM(c.result), '') = '' "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM task_runs r WHERE r.task_id = c.id "
+            "AND COALESCE(TRIM(r.summary), '') <> ''"
+            ") ORDER BY c.id",
+            (task_id,),
+        ).fetchall()
+        if not open_empty:
+            return
+        if isinstance(metadata, dict):
+            if "superseded_by" in metadata:
+                return
+            allow_reason = metadata.get("allow_open_children")
+            if isinstance(allow_reason, str) and allow_reason.strip():
+                return
+        blockers = [(child["id"], child["status"]) for child in open_empty]
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_empty_result",
+                {
+                    "result_len": len(result) if result else 0,
+                    "summary_preview": _first_line(summary, 200) or None,
+                    "open_children": [
+                        {"id": child_id, "status": status}
+                        for child_id, status in blockers
+                    ],
+                },
+            )
+        raise OpenChildrenCompletionError(task_id, blockers)
     with write_txn(conn):
         _append_event(
             conn, task_id, "completion_blocked_empty_result",
