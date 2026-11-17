@@ -243,3 +243,118 @@ def test_review_parent_with_open_child_still_approved(conn):
     assert kb.complete_task(conn, parent) is True
     assert kb.get_task(conn, parent).status == "done"
     assert "completion_blocked_open_children" not in _event_kinds(conn, parent)
+
+
+def test_review_claimed_parent_with_open_child_completes(conn):
+    """Regression: a reviewer that CLAIMED the review completes from
+    ``running`` — the run's ``claimed`` event (``source_status=review``) keeps
+    the approval exemption, the same evidence ``_retry_status_for_run`` reads.
+    A plain implementation run with an open child stays gated."""
+    parent = kb.create_task(conn, title="parent", assignee="coder")
+    assert kb.claim_task(conn, parent, claimer=kb._claimer_id()) is not None
+    kb.create_task(conn, title="child", assignee="coder", parents=[parent])
+    assert kb.request_review(conn, parent, summary="implementation finished") is not None
+    assert kb.get_task(conn, parent).status == "review"
+    review = kb.claim_review_task(conn, parent)
+    assert review is not None
+    assert review.status == "running"
+    assert kb.complete_task(
+        conn, parent, summary="approved",
+        expected_run_id=review.current_run_id,
+    ) is True
+    assert kb.get_task(conn, parent).status == "done"
+    assert "completion_blocked_open_children" not in _event_kinds(conn, parent)
+
+    # Control: same shape, but the run was claimed from ready — still gated.
+    plain = kb.create_task(conn, title="plain parent", assignee="coder")
+    assert kb.claim_task(conn, plain, claimer=kb._claimer_id()) is not None
+    kb.create_task(conn, title="plain child", assignee="coder", parents=[plain])
+    with pytest.raises(kb.OpenChildrenWithoutEvidenceError):
+        kb.complete_task(conn, plain, summary="implementation finished")
+    assert kb.get_task(conn, plain).status == "running"
+
+
+@pytest.mark.parametrize("child_status", ["blocked", "ready", "running", "scheduled"])
+def test_open_child_rejects_for_every_non_terminal_status(conn, child_status):
+    """Every non-terminal child status trips the gate, and the refusal names
+    each child as ``id (status)``. ``blocked`` comes from initial_status,
+    ``running`` via a direct status write (a real claim is impossible under a
+    running parent and ``link_tasks`` refuses running children),
+    ``scheduled`` via ``schedule_task`` without a reason (a reason becomes the
+    run summary — evidence — and would rightly pass)."""
+    parent = kb.create_task(conn, title="parent", assignee="coder")
+    assert kb.claim_task(conn, parent, claimer=kb._claimer_id()) is not None
+    if child_status == "blocked":
+        child = kb.create_task(
+            conn, title="child", assignee="coder", parents=[parent],
+            initial_status="blocked",
+        )
+    else:
+        child = kb.create_task(conn, title="child", assignee="coder", parents=[parent])
+        if child_status == "scheduled":
+            assert kb.schedule_task(conn, child)
+        elif child_status == "running":
+            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (child,))
+            conn.commit()
+        elif child_status == "ready":
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child,))
+            conn.commit()
+    assert kb.get_task(conn, child).status == child_status
+    with pytest.raises(kb.OpenChildrenWithoutEvidenceError) as ei:
+        kb.complete_task(conn, parent, summary="closing too early")
+    assert f"{child} ({child_status})" in str(ei.value)
+    assert ei.value.children == [(child, child_status)]
+    assert kb.get_task(conn, parent).status == "running"
+
+
+def test_whitespace_only_child_evidence_still_blocks(conn):
+    """Whitespace is not evidence: a child whose ``result`` is blank-only AND
+    whose only run summary is blank-only still trips the gate. The run is
+    opened by a claim, then the card is parked back on ``todo`` to link under
+    the parent (``link_tasks`` refuses running children)."""
+    parent = kb.create_task(conn, title="parent", assignee="coder")
+    assert kb.claim_task(conn, parent, claimer=kb._claimer_id()) is not None
+    child = kb.create_task(conn, title="child", assignee="coder")
+    assert kb.claim_task(conn, child, claimer=kb._claimer_id()) is not None
+    conn.execute("UPDATE tasks SET status = 'todo', result = ? WHERE id = ?", ("   \n", child))
+    conn.execute("UPDATE task_runs SET summary = '  ' WHERE task_id = ?", (child,))
+    conn.commit()
+    assert kb.link_tasks(conn, parent, child) is not None
+    with pytest.raises(kb.OpenChildrenWithoutEvidenceError):
+        kb.complete_task(conn, parent, summary="closing too early")
+    assert kb.get_task(conn, parent).status == "running"
+
+
+@pytest.mark.parametrize("field", ["result", "run_summary"])
+def test_real_text_child_evidence_passes(conn, field):
+    """Any substantive text in EITHER evidence field exempts the child."""
+    parent = kb.create_task(conn, title="parent", assignee="coder")
+    assert kb.claim_task(conn, parent, claimer=kb._claimer_id()) is not None
+    if field == "result":
+        child = kb.create_task(conn, title="child", assignee="coder", parents=[parent])
+        conn.execute(
+            "UPDATE tasks SET result = ? WHERE id = ?", ("child findings attached", child)
+        )
+        conn.commit()
+    else:
+        child = kb.create_task(conn, title="child", assignee="coder")
+        assert kb.claim_task(conn, child, claimer=kb._claimer_id()) is not None
+        assert kb.complete_task(conn, child, summary="investigated; notes on file") is True
+        conn.execute("UPDATE tasks SET status = 'todo', result = '' WHERE id = ?", (child,))
+        conn.commit()
+        assert kb.link_tasks(conn, parent, child) is not None
+    assert kb.complete_task(conn, parent, summary="child carried real evidence") is True
+    assert kb.get_task(conn, parent).status == "done"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_superseded_by_blank_is_not_an_override(conn, blank):
+    """``superseded_by`` must be a non-empty string; blank values must not
+    bypass the gate (the real-string pass case is pinned above)."""
+    parent, _kids = _parent_with_open_children(conn)
+    with pytest.raises(kb.OpenChildrenWithoutEvidenceError):
+        kb.complete_task(
+            conn, parent, summary="closing early",
+            metadata={"superseded_by": blank},
+        )
+    assert kb.get_task(conn, parent).status == "running"

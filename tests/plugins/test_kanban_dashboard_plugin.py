@@ -266,7 +266,12 @@ def test_reopening_parent_demotes_ready_child(client):
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "done", "result": "done", "summary": "done"},
+        json={
+            "status": "done",
+            "result": "done",
+            "summary": "done",
+            "metadata": {"allow_open_children": "operator closed parent; child tracked separately"},
+        },
     )
     assert r.status_code == 200
 

@@ -882,10 +882,14 @@ def test_worker_lifecycle_through_tools(worker_env):
     }))
     assert child_out["ok"]
 
-    # 5. complete with structured handoff
+    # 5. complete with structured handoff; the follow-up child is still open
+    # and evidence-less, so the operator override names why that is fine.
     comp = json.loads(kt._handle_complete({
         "summary": "implemented + spawned QA follow-up",
-        "metadata": {"child_task": child_out["task_id"]},
+        "metadata": {
+            "child_task": child_out["task_id"],
+            "allow_open_children": "spawned QA follow-up child; follow-up tracked separately",
+        },
     }))
     assert comp["ok"]
 
@@ -899,7 +903,10 @@ def test_worker_lifecycle_through_tools(worker_env):
         assert parent.current_run_id is None
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
-        assert run.metadata == {"child_task": child_out["task_id"]}
+        assert run.metadata == {
+            "child_task": child_out["task_id"],
+            "allow_open_children": "spawned QA follow-up child; follow-up tracked separately",
+        }
         # Child is todo (parent just finished, but recompute_ready may
         # have promoted it — complete_task runs recompute internally).
         child = kb.get_task(conn, child_out["task_id"])

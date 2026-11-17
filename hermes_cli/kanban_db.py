@@ -2844,9 +2844,13 @@ def _gate_open_children_without_evidence(
     ``tasks.result`` or a substantive ``summary`` on any of its runs.
 
     Review approvals stay exempt like ``_gate_empty_completion`` (the human
-    is the record). Reads the raw ``metadata`` the caller passed to
-    ``complete_task`` (before ``_merge_completion_prose_artifacts`` rewrites
-    it): a non-empty string ``superseded_by`` (supersede-close) or
+    is the record) — including one whose review was claimed, because
+    :func:`claim_review_task` moves the card to ``running``; the run's
+    ``claimed`` event (``source_status=review``) is the evidence, the same
+    pattern :func:`_retry_status_for_run` reads. Reads the raw ``metadata``
+    the caller passed to ``complete_task`` (before
+    ``_merge_completion_prose_artifacts`` rewrites it): a non-empty string
+    ``superseded_by`` (supersede-close) or
     ``allow_open_children`` (operator override, value is the reason) passes.
     Otherwise the refusal is auditable then raised, naming every open
     evidence-less child so nothing dead-locks silently.
@@ -2856,6 +2860,8 @@ def _gate_open_children_without_evidence(
         (task_id,),
     ).fetchone()
     if row is None or row["status"] == "review":
+        return
+    if _retry_status_for_run(conn, task_id) == "review":
         return
     open_empty: list[tuple[str, str]] = []
     for child_id in sorted(child_ids(conn, task_id)):
