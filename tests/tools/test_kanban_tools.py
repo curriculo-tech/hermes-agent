@@ -53,6 +53,13 @@ def worker_env(monkeypatch, tmp_path):
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
+    # Profiles the kanban_create intake gate accepts: handlers below spawn
+    # child cards for "peer"/"qa", which must be addressable assignees.
+    for _name in ("peer", "qa"):
+        _prof = home / "profiles" / _name
+        _prof.mkdir(parents=True, exist_ok=True)
+        (_prof / "config.yaml").write_text("", encoding="utf-8")
+
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     kb._INITIALIZED_PATHS.clear()
@@ -1274,6 +1281,9 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     # home to avoid mkdir() colliding with the worker's directory.
     home = tmp_path / "gate-home" / ".hermes"
     home.mkdir(parents=True)
+    # The create intake gate validates against THIS home: give "peer" a profile.
+    (home / "profiles" / "peer").mkdir(parents=True)
+    (home / "profiles" / "peer" / "config.yaml").write_text("", encoding="utf-8")
     (home / "config.yaml").write_text(
         "kanban:\n  auto_subscribe_on_create: false\n"
     )

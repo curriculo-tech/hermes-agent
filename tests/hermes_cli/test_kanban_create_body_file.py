@@ -28,6 +28,10 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # The create intake gate only accepts dispatcher profiles / personas:
+    # give "baxter" a profile directory so the create below is valid.
+    (home / "profiles" / "baxter").mkdir(parents=True)
+    (home / "profiles" / "baxter" / "config.yaml").write_text("", encoding="utf-8")
     kb.init_db()
     return home
 
@@ -61,6 +65,7 @@ def test_body_file_stores_body_verbatim_with_trailing_flags_intact(kanban_home, 
 
 
 def test_body_file_dash_reads_stdin(kanban_home, monkeypatch, capsys):
-    assert _create(["PROBE", "--body-file", "-"], monkeypatch, stdin=BODY) == 0
+    assert _create(["PROBE", "--body-file", "-", "--assignee", "baxter"],
+                   monkeypatch, stdin=BODY) == 0
     capsys.readouterr()
     assert _latest_body().body == BODY

@@ -22,6 +22,7 @@ def board_env(tmp_path, monkeypatch):
     root = tmp_path / "hroot"
     for name in ("alpha", "beta"):
         (root / "profiles" / name).mkdir(parents=True)
+        (root / "profiles" / name / "config.yaml").write_text("", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
     for var in ("HERMES_PROFILE", "HERMES_PROFILE_NAME", "HERMES_SESSION_ID", "HERMES_KANBAN_DB",
                 "HERMES_KANBAN_HOME", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACES_ROOT"):
@@ -76,7 +77,7 @@ def test_a_served_profiles_tick_authors_board_records_as_that_profile(board_env,
             assert out["ok"], out
             assert _last_comment_author(tid) == name
             child = json.loads(kt._handle_create(
-                {"title": f"{name} child", "assignee": "peer", "parents": [tid]}))
+                {"title": f"{name} child", "assignee": "beta", "parents": [tid]}))
             assert child["ok"], child
             assert _created_by(child["task_id"]) == name
         finally:
