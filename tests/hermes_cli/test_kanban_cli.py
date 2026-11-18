@@ -207,7 +207,8 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
     failures: list[str] = []
 
     def worker(board: str, title: str) -> None:
-        args = parser.parse_args(["kanban", "--board", board, "create", title])
+        args = parser.parse_args(["kanban", "--board", board, "create", title,
+                                  "--assignee", "default"])
         rc = kc.kanban_command(args)
         if rc != 0:
             failures.append(f"{board}:{rc}")
@@ -249,6 +250,9 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import secrets
     from hermes_cli import kanban_db_connect as kbc
 
+    # The create intake gate only accepts dispatcher profiles / personas.
+    (kanban_home / "profiles" / "broken-model").mkdir(parents=True)
+    (kanban_home / "profiles" / "broken-model" / "config.yaml").write_text("", encoding="utf-8")
     out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
     m = re.search(r"(t_[a-f0-9]+)", out1)
     assert m

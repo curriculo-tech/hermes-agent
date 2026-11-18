@@ -18,6 +18,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_assignees
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
@@ -360,9 +361,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    # Intake gate: a card whose assignee names no dispatcher profile or
+    # persona can never be claimed — reject instead of parking it in 'ready'.
+    try:
+        assignee = kanban_assignees.validate_assignee(getattr(args, "assignee", None))
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
-            conn, title=args.title, body=body, assignee=args.assignee,
+            conn, title=args.title, body=body, assignee=assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
@@ -570,8 +577,23 @@ def _cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validated_profile(profile: Optional[str]) -> tuple[Optional[str], int]:
+    """Validate an explicit assign/reassign profile against the assignee
+    registry: ``(profile, 0)`` or ``(None, 2)`` after printing the error.
+    ``None`` (the ``none``/``-`` unassign spelling) passes through — unassign
+    keeps its existing semantics."""
+    if profile is None:
+        return None, 0
+    try:
+        return kanban_assignees.validate_assignee(profile), 0
+    except ValueError as exc:
+        return None, _err(f"kanban: {exc}", 2)
+
+
 def _cmd_assign(args: argparse.Namespace) -> int:
-    profile = _none_profile(args.profile)
+    profile, rc = _validated_profile(_none_profile(args.profile))
+    if rc:
+        return rc
     with kbc.connect_closing() as conn:
         ok = kb.assign_task(conn, args.task_id, profile)
     return _ok_or_err(ok, f"no such task: {args.task_id}",
@@ -606,7 +628,9 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
-    profile = _none_profile(args.profile)
+    profile, rc = _validated_profile(_none_profile(args.profile))
+    if rc:
+        return rc
     reclaim = bool(getattr(args, "reclaim", False))
     with kbc.connect_closing() as conn:
         ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))

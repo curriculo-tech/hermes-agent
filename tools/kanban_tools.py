@@ -1097,8 +1097,14 @@ def _handle_create(args: dict, **kw) -> str:
     _reject_delegated_child_mutation("kanban_create")
     title = _require_text(args, "title")
     assignee = args.get("assignee")
-    _check(assignee, "assignee is required — name the profile that should execute this "
-                     "task (the dispatcher will only spawn tasks with an assignee)")
+    # Intake gate, shared with the CLI: an empty or unknown assignee names no
+    # dispatcher profile or persona, so the card could never dispatch — reject
+    # here instead of parking an undead card in 'ready'.
+    from hermes_cli import kanban_assignees as _kba
+    try:
+        assignee = _kba.validate_assignee(assignee)
+    except ValueError as exc:
+        _check(False, str(exc))
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
     # mutate review evidence or race its checkout). Project identity is the one safe thing
