@@ -2604,6 +2604,25 @@ class EmptyCompletionError(ValueError):
         )
 
 
+class OpenChildrenWithoutEvidenceError(ValueError):
+    """``complete_task`` refused: an empty-evidence completion while the card
+    still has children that are neither ``done``/``archived`` nor carrying
+    their own evidence (``.children`` holds ``(id, status)`` pairs). A
+    ``ValueError`` so tool error handlers treat it as recoverable. A
+    substantive ``result``/``summary`` never reaches this refusal; explicit
+    carve-outs: ``metadata['superseded_by']`` and
+    ``metadata['allow_open_children']``."""
+
+    def __init__(self, task_id: str, children: list[tuple[str, str]]):
+        self.task_id = task_id
+        self.children = list(children)
+        listed = ", ".join(f"{child_id} ({status})" for child_id, status in self.children)
+        super().__init__(
+            f"completion blocked: {task_id} has open children "
+            f"without evidence (and no result/summary on this completion): {listed}"
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -2659,6 +2678,11 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+    An evidence-less completion of a parent additionally refuses while a
+    child is neither ``done``/``archived`` nor carrying evidence
+    (:class:`OpenChildrenWithoutEvidenceError`); a substantive result or
+    summary always completes, and ``metadata['superseded_by']`` /
+    ``metadata['allow_open_children']`` are explicit carve-outs.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2666,6 +2690,14 @@ def complete_task(
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
+    # The open-children gate runs first so the child-naming refusal wins over
+    # the generic empty-evidence refusal: naming the open children is
+    # the actionable diagnostic for exactly this case. It is narrowed to
+    # completions that bring no new evidence: a substantive result/summary
+    # always completes ("never reject non-empty evidence").
+    _gate_open_children_without_evidence(
+        conn, task_id, metadata=metadata, result=result, summary=summary,
+    )
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
@@ -2806,6 +2838,98 @@ def _gate_empty_completion(
             },
         )
     raise EmptyCompletionError(task_id)
+
+
+def _gate_open_children_without_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    metadata: Optional[dict],
+    result: Optional[str],
+    summary: Optional[str],
+) -> None:
+    """Refuse an evidence-less completion of a parent while a child is
+    neither terminal (``done``/``archived``) nor carrying evidence —
+    substantive ``tasks.result`` or a substantive ``summary`` on any of
+    its runs.
+
+    Narrowed to the loop-gate-noop spec ("empty-evidence parent complete",
+    "never reject non-empty evidence"):
+
+    - Only statuses ``complete_task`` can actually close
+      (``running|ready|blocked|review``) are gated; terminal/unknown
+      statuses return so ``complete_task`` keeps reporting them as bare
+      ``False`` instead of raising.
+    - Review approvals stay exempt like ``_gate_empty_completion`` (the
+      human is the record) — including one whose review was claimed,
+      because :func:`claim_review_task` moves the card to ``running``; the
+      run's ``claimed`` event (``source_status=review``) is the evidence,
+      the same pattern :func:`_retry_status_for_run` reads.
+    - A parent whose completion itself carries evidence (substantive
+      ``result`` or ``summary``; whitespace-only is empty) always passes —
+      the normal worker/spawn and stage-handoff flows must not need an
+      override.
+
+    Reads the raw ``metadata`` the caller passed to ``complete_task``
+    (before ``_merge_completion_prose_artifacts`` rewrites it): a
+    non-empty string ``superseded_by`` (supersede-close) or
+    ``allow_open_children`` (operator override, value is the reason)
+    passes. Otherwise the refusal is auditable then raised, naming every
+    open evidence-less child so nothing dead-locks silently.
+    """
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    # Terminal/unknown statuses: not gated — complete_task's status-guarded
+    # UPDATE is what must answer them, with its bare False (no raise).
+    if row is None or row["status"] not in ("running", "ready", "blocked", "review"):
+        return
+    if row["status"] == "review":
+        return
+    if _retry_status_for_run(conn, task_id) == "review":
+        return
+    if _substantive_text(result) or _substantive_text(summary):
+        return
+    open_empty: list[tuple[str, str]] = []
+    for child_id in sorted(child_ids(conn, task_id)):
+        trow = conn.execute(
+            "SELECT status, result FROM tasks WHERE id = ?", (child_id,),
+        ).fetchone()
+        if trow is None or trow["status"] in ("done", "archived"):
+            continue
+        if _substantive_text(trow["result"]):
+            continue
+        run_summaries = conn.execute(
+            "SELECT summary FROM task_runs WHERE task_id = ?", (child_id,),
+        ).fetchall()
+        if any(_substantive_text(r["summary"]) for r in run_summaries):
+            continue
+        open_empty.append((child_id, trow["status"]))
+    if not open_empty:
+        return
+
+    def _override(key: str) -> Optional[str]:
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get(key)
+        return value if isinstance(value, str) and value.strip() else None
+
+    if _override("superseded_by") is not None:
+        return
+    if _override("allow_open_children") is not None:
+        return
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "completion_blocked_open_children",
+            {
+                "children": [
+                    {"id": child_id, "status": status} for child_id, status in open_empty
+                ],
+                "reason": "open_children_without_evidence",
+            },
+        )
+    raise OpenChildrenWithoutEvidenceError(task_id, open_empty)
 
 
 def _stage_completion_artifacts(

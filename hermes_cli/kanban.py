@@ -931,6 +931,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")
                 return False
+            except kb.OpenChildrenWithoutEvidenceError as open_err:
+                fail_msg[tid] = (f"cannot complete {tid}: {open_err}. Finish or unlink those "
+                                 f"children first, or re-run with --metadata "
+                                 f"'{{\"allow_open_children\": \"<reason>\"}}' to close anyway "
+                                 f"(or '{{\"superseded_by\": \"<card>\"}}' when the card was "
+                                 f"superseded).")
+                return False
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
                 # name the open parents instead of claiming the id is unknown.
