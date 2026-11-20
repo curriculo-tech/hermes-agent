@@ -131,8 +131,10 @@ def test_cli_complete_open_children_is_friendly_failure(
 
     parent_id, child_id = running_parent_with_open_child
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    # No result/summary: the narrowed gate only refuses evidence-less
+    # completions, so the refusal needs empty evidence to fire.
     rc = kc._cmd_complete(argparse.Namespace(
-        task_ids=[parent_id], result=None, summary="stage done", metadata=None, force=False))
+        task_ids=[parent_id], result=None, summary=None, metadata=None, force=False))
     out = capsys.readouterr()
     assert rc != 0
     assert child_id in out.out + out.err
@@ -149,7 +151,10 @@ def test_tool_complete_open_children_returns_error_string(running_parent_with_op
     from tools import kanban_tools as kt
 
     parent_id, child_id = running_parent_with_open_child
-    out = kt._handle_complete({"task_id": parent_id, "summary": "stage handoff"})
+    # Empty evidence: this surface requires a summary/result arg, so pass a
+    # whitespace-only summary — the kernel's _substantive_text reads it as
+    # empty and the narrowed open-children refusal fires.
+    out = kt._handle_complete({"task_id": parent_id, "summary": "   "})
     assert isinstance(out, str)
     payload = json.loads(out)
     assert payload.get("error")

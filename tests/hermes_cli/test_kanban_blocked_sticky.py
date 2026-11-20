@@ -167,13 +167,7 @@ def test_created_with_initial_status_blocked_is_not_promoted_by_recompute_ready(
 
         # Complete parent task
         kb.claim_task(conn, parent_id)
-        # Override is explicit: this test deliberately closes the parent while the child is still open.
-        kb.complete_task(
-            conn,
-            parent_id,
-            result="done",
-            metadata={"allow_open_children": "blocked child deliberately left open"},
-        )
+        kb.complete_task(conn, parent_id, result="done")
         assert kb.get_task(conn, parent_id).status == "done"
 
         # recompute_ready must NOT promote the blocked child task
